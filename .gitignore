@@ -1,1 +1,9 @@
+### Rust
 /target
+
+### Other
+# direnv
+.direnv
+
+# nix build output symlink
+result

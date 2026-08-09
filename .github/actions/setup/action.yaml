@@ -1,0 +1,37 @@
+name: setup
+description: Install nix, restore the nix store.
+
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      with:
+        extra-conf: |
+          keep-env-derivations = true
+          keep-outputs = true
+
+    - name: cache nix store
+      uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+        # On a primary-key miss, restore the most recent cache sharing this
+        # prefix, so we start from a warm store instead of an empty one.
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        # Garbage-collect the store before saving, so the cache stays small
+        # (Linux-only override of gc-max-store-size). The Rust toolchain alone
+        # (rustc, clippy, rust-analyzer) is well over 1G; a smaller limit
+        # would evict it on every save and defeat the cache.
+        gc-max-store-size-linux: 4G
+        purge: true
+        purge-prefixes: nix-${{ runner.os }}-
+        # 0 makes the creation-age filter always match, leaving last-accessed
+        # below as the sole purge criterion.
+        purge-created: 0
+        # Purge matched caches not accessed in the last 1.5 days (LRU cleanup).
+        purge-last-accessed: P1DT12H
+        # ...but never purge the cache we just matched/saved this run.
+        purge-primary-key: never
+
+    - name: fetch dependencies
+      shell: bash
+      run: nix develop --command cargo fetch

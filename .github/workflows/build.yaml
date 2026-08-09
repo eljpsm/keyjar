@@ -1,0 +1,33 @@
+# Run the build.
+name: build
+
+permissions:
+  contents: read
+  # See https://github.com/nix-community/cache-nix-action#single-step-for-restore-and-save
+  actions: write
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let every main commit finish so its nix
+  # store cache save completes and the next run starts warm.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+
+      # Builds the flake package; buildRustPackage runs `cargo test` in its
+      # check phase, so this is also the sandboxed test run.
+      - name: run build
+        run: nix build

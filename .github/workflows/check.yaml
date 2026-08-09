@@ -1,0 +1,34 @@
+# Run checks.
+name: check
+
+permissions:
+  contents: read
+  # See https://github.com/nix-community/cache-nix-action#single-step-for-restore-and-save
+  actions: write
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel superseded PR runs, but let every main commit finish so its nix
+  # store cache save completes and the next run starts warm.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup
+
+      - name: fmt
+        run: nix develop --command cargo fmt --check
+
+      - name: lint
+        run: nix develop --command make lint
