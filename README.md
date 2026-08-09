@@ -69,6 +69,10 @@ It is a standard age identity, so `age -d -i ~/.config/keyjar/identity FILE.age`
 also works. A store belongs to the identity that first wrote to it. Copy the
 directory whole to move or back it up.
 
+> [!WARNING]
+> Secret values are encrypted. Entry names, directory structure, file sizes, and
+> change history are not.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
