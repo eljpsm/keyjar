@@ -29,5 +29,5 @@ jobs:
 
       # Builds the flake package; buildRustPackage runs `cargo test` in its
       # check phase, so this is also the sandboxed test run.
-      - name: run build
-        run: nix build
+      - name: build and test
+        run: nix build -L
