@@ -16,7 +16,7 @@ nix run github:eljpsm/keyjar
 make install
 ```
 
-## Use
+## Usage
 
 ```bash
 # Set a value.

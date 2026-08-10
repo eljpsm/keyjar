@@ -1,4 +1,4 @@
-.PHONY: build install test coverage coverage-html lint fmt
+.PHONY: build install test test-cli coverage coverage-html lint fmt
 
 # Build the release binary.
 build:
@@ -11,6 +11,10 @@ install:
 # Run all tests.
 test:
 	cargo test
+
+# End-to-end binary tests (exit codes, hidden input, store handling).
+test-cli:
+	cargo test --test cli
 
 # Line and region coverage across all tests, printed per file.
 coverage:

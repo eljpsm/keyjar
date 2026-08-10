@@ -5,16 +5,26 @@ edition = "2024"
 # Floor set by edition 2024.
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
+autolib = false
 publish = false
 description = "A minimal CLI stash for API keys and small secrets, built for shells and scripts rather than logins."
 repository = "https://github.com/eljpsm/keyjar"
 
 [dependencies]
 age = "0.12"
-anyhow = "1.0"
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tempfile = "3"
 
 [dev-dependencies]
 nix = { version = "0.30", features = ["term"] }
+
+[profile.release]
+strip = true
+lto = true
+
+# Make plain `cargo clippy` and rust-analyzer as strict as CI. Clippy lints
+# do not run under `cargo build`, so toolchain bumps cannot break `nix build`.
+[lints.clippy]
+all = "deny"
