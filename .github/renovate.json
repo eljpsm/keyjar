@@ -1,0 +1,3 @@
+{
+  "extends": ["github>eljpsm/renovate-config"]
+}
