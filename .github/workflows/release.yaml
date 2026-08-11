@@ -1,0 +1,39 @@
+# Build and publish release binaries when a version tag is pushed.
+# Tag with `make release`.
+name: release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # Full history so goreleaser can build the changelog from the
+          # commits since the previous tag.
+          fetch-depth: 0
+
+      # cargo-zigbuild needs zig on PATH.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2
+        with:
+          tool: cargo-zigbuild
+
+      # The runner ships rustup. goreleaser runs `rustup target add` for
+      # each target in .goreleaser.yaml itself.
+      - name: rustup
+        run: rustup update stable
+
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

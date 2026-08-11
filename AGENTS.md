@@ -11,6 +11,13 @@ Common tasks live in the [Makefile](Makefile).
 
 To run unit tests matching a name, use cargo directly: `cargo test NAME`.
 
+## Releases
+
+Bump the version in Cargo.toml, commit, then `make release`. It tags
+`v<version>` and pushes the tag. CI runs goreleaser, which cross-compiles with
+cargo-zigbuild and attaches the binaries to a GitHub release. The changelog is
+the commit log since the last tag, so no CHANGELOG.md exists.
+
 ## Writing style
 
 Applies to code comments, commit messages, and any prose you add (docs, READMEs,

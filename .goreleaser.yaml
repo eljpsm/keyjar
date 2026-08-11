@@ -1,0 +1,16 @@
+# Release config for goreleaser, run by .github/workflows/release.yaml on
+# version tags. cargo-zigbuild cross-compiles every target from one Linux
+# runner. Defaults cover the rest: --release flags, tar.gz archives with
+# README and LICENSE, checksums, and a changelog from the commit log.
+version: 2
+
+project_name: keyjar
+
+builds:
+  - builder: rust
+    binary: keyjar
+    # Linux only. Add darwin or windows targets here if a tool grows that
+    # audience.
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu

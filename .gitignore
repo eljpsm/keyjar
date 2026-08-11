@@ -7,3 +7,6 @@
 
 # nix build output symlink
 result
+
+# goreleaser build output
+/dist

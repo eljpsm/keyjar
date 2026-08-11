@@ -1,4 +1,6 @@
-.PHONY: build install test test-cli coverage coverage-html lint fmt
+.PHONY: build install test test-cli coverage coverage-html lint fmt release
+
+VERSION = $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
 
 # Build the release binary.
 build:
@@ -31,3 +33,9 @@ lint:
 # Format the Rust source.
 fmt:
 	cargo fmt
+
+# Tag the current commit with the Cargo.toml version and push the tag.
+# CI then runs goreleaser and publishes the binaries.
+release:
+	git tag "v$(VERSION)"
+	git push origin "v$(VERSION)"

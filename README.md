@@ -16,6 +16,9 @@ nix run github:eljpsm/keyjar
 make install
 ```
 
+Prebuilt Linux binaries are on the [releases
+page](https://github.com/eljpsm/keyjar/releases).
+
 ## Usage
 
 ```bash
