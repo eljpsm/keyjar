@@ -53,6 +53,14 @@ pub enum Command {
         #[arg(short, long)]
         force: bool,
     },
+    /// Rename an entry. Asks before overwriting an existing destination.
+    Mv {
+        old: Name,
+        new: Name,
+        /// Overwrite an existing destination without confirming.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Edit a value in $EDITOR. Creates the entry if it does not exist.
     Edit { name: Name },
     /// Print export lines for eval.
@@ -67,6 +75,12 @@ pub enum Command {
         /// The command, after --.
         #[arg(last = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Re-encrypt every entry to a freshly generated identity.
+    Rekey {
+        /// Rekey without confirming.
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -129,9 +143,13 @@ mod tests {
             vec!["keyjar", "ls"],
             vec!["keyjar", "ls", "work"],
             vec!["keyjar", "rm", "openai", "-f"],
+            vec!["keyjar", "mv", "openai", "work/openai"],
+            vec!["keyjar", "mv", "openai", "work/openai", "-f"],
             vec!["keyjar", "edit", "openai"],
             vec!["keyjar", "env"],
             vec!["keyjar", "env", "work"],
+            vec!["keyjar", "rekey"],
+            vec!["keyjar", "rekey", "-f"],
         ] {
             parse(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
         }

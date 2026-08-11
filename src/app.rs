@@ -42,9 +42,11 @@ fn execute(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Show { name } => show(&store, &name),
         Command::Ls { prefix } => ls(&store, prefix.as_ref()),
         Command::Rm { name, force } => rm(&store, &name, force, quiet),
+        Command::Mv { old, new, force } => mv(&store, &old, &new, force, quiet),
         Command::Edit { name } => edit(&store, &name, quiet),
         Command::Env { prefix } => env(&store, prefix.as_ref()),
         Command::Run { prefix, cmd } => run_cmd(&store, prefix.as_ref(), &cmd),
+        Command::Rekey { force } => rekey(&store, force, quiet),
     }
 }
 
@@ -125,6 +127,35 @@ fn rm(store: &Store, name: &Name, force: bool, quiet: bool) -> anyhow::Result<Ex
         bail!("no entry named {name}");
     }
     notice(quiet, format_args!("removed {name}"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Ciphertext moves unchanged (one recipient per store), so no identity is
+/// loaded anywhere on this path.
+fn mv(store: &Store, old: &Name, new: &Name, force: bool, quiet: bool) -> anyhow::Result<ExitCode> {
+    if old == new {
+        bail!("source and destination are the same");
+    }
+    // Check first so the prompt never names an entry that is not there. The
+    // store can change while the user reads it, hence the recheck in rename.
+    if !store.contains(old)? {
+        bail!("no entry named {old}");
+    }
+    let mut overwrite = force;
+    if !force && store.contains(new)? {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to overwrite {new} without --force when stdin is not a terminal");
+        }
+        if !tty::confirm(&format!("keyjar: overwrite {new}? [y/N] "))? {
+            // Declining is not an error.
+            return Ok(ExitCode::SUCCESS);
+        }
+        overwrite = true;
+    }
+    if !store.rename(old, new, overwrite)? {
+        bail!("no entry named {old}");
+    }
+    notice(quiet, format_args!("renamed {old} to {new}"));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -215,6 +246,98 @@ fn decrypted_pairs(
             Ok((var, name, value))
         })
         .collect()
+}
+
+/// The invariant across every crash point: a key that decrypts each entry is
+/// on disk. The new key lands at identity.new before any entry changes, the
+/// marker is written last inside the store lock, and the old key survives as
+/// identity.old. Only the final renames retire the old key.
+fn rekey(store: &Store, force: bool, quiet: bool) -> anyhow::Result<ExitCode> {
+    let identity_path = paths::identity_path()?;
+    let old_identity = crypt::load_identity(&identity_path)?;
+    let old_path = paths::identity_sibling(&identity_path, ".old");
+    let new_path = paths::identity_sibling(&identity_path, ".new");
+    if old_path.exists() {
+        bail!(
+            "found {} from a previous rekey; delete it once nothing depends on it, then rerun",
+            old_path.display()
+        );
+    }
+    if new_path.exists() {
+        bail!(
+            "{}",
+            interrupted_rekey_message(store, &identity_path, &new_path)?
+        );
+    }
+    if store.list(None)?.is_empty() && store.bound_recipient()?.is_none() {
+        bail!("store is empty; nothing to rekey");
+    }
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            bail!("refusing to rekey without --force when stdin is not a terminal");
+        }
+        if !tty::confirm("keyjar: re-encrypt the store and replace the identity? [y/N] ")? {
+            // Declining is not an error.
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    let new_identity = age::x25519::Identity::generate();
+    let count = store.rekey(
+        &old_identity.to_public(),
+        &new_identity.to_public(),
+        |_, ciphertext| {
+            let plaintext = crypt::decrypt(&old_identity, ciphertext)?;
+            crypt::encrypt(&new_identity, &plaintext)
+        },
+        || {
+            crypt::write_identity_file(&new_path, &new_identity)
+                .with_context(|| format!("writing {}", new_path.display()))
+        },
+    )?;
+    std::fs::rename(&identity_path, &old_path)
+        .with_context(|| format!("moving {} aside", identity_path.display()))?;
+    std::fs::rename(&new_path, &identity_path)
+        .with_context(|| format!("installing {}", identity_path.display()))?;
+    let entries = if count == 1 { "entry" } else { "entries" };
+    notice(quiet, format_args!("rekeyed {count} {entries}"));
+    notice(
+        quiet,
+        format_args!("new public key: {}", new_identity.to_public()),
+    );
+    notice(
+        quiet,
+        format_args!(
+            "previous key kept at {}; delete it once no other store needs it",
+            old_path.display()
+        ),
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A leftover identity.new means a rekey died. Whether it finished decides
+/// the advice: the marker is written last, so a marker matching identity.new
+/// proves every entry was rewritten and only the file swap remains.
+fn interrupted_rekey_message(
+    store: &Store,
+    identity: &std::path::Path,
+    new_path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let finished = match crypt::load_identity(new_path) {
+        Ok(new_identity) => store.bound_recipient()?.as_ref() == Some(&new_identity.to_public()),
+        Err(_) => false,
+    };
+    let (id, new) = (identity.display(), new_path.display());
+    if finished {
+        Ok(format!(
+            "an interrupted rekey already rotated this store; finish it: mv {id} {id}.old && mv {new} {id}"
+        ))
+    } else {
+        Ok(format!(
+            "an interrupted rekey left {new}; entries may be split between the two keys. \
+             Decrypt with `age -d -i {id} -i {new}`, re-set any entry keyjar cannot read, \
+             then delete {new}"
+        ))
+    }
 }
 
 fn read_entry(store: &Store, name: &Name) -> anyhow::Result<Vec<u8>> {

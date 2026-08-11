@@ -379,6 +379,67 @@ fn rm_refuses_a_pipe_without_force_and_prunes_with_it() {
 }
 
 #[test]
+fn mv_renames_and_the_value_survives() {
+    let jar = Sandbox::new();
+    jar.set("work/deep/key", b"v\n");
+
+    let out = jar.run(&["mv", "work/deep/key", "personal/key"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(jar.run(&["get", "personal/key"]).stdout, b"v");
+    assert_eq!(code(&jar.run(&["get", "work/deep/key"])), 1);
+    assert!(!jar.store_dir().join("work").exists());
+}
+
+#[test]
+fn mv_onto_an_existing_entry_refuses_a_pipe_and_overwrites_with_force() {
+    let jar = Sandbox::new();
+    jar.set("a", b"one\n");
+    jar.set("b", b"two\n");
+
+    // A pipe cannot confirm the overwrite, so it must refuse.
+    let out = jar.run_with_stdin(&["mv", "a", "b"], b"y\n");
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    assert_eq!(jar.run(&["get", "b"]).stdout, b"two");
+
+    let out = jar.run(&["mv", "-f", "a", "b"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(jar.run(&["get", "b"]).stdout, b"one");
+    assert_eq!(code(&jar.run(&["get", "a"])), 1);
+}
+
+#[test]
+fn terminal_mv_confirms_before_overwriting() {
+    let jar = Sandbox::new();
+    jar.set("a", b"one\n");
+    jar.set("b", b"two\n");
+
+    let mut child = PtyChild::spawn(jar.command(&["mv", "a", "b"]));
+    child.read_until(b"overwrite b? [y/N] ");
+    child.write(b"n\n");
+    assert!(child.finish().status.success());
+    assert_eq!(jar.run(&["get", "a"]).stdout, b"one");
+    assert_eq!(jar.run(&["get", "b"]).stdout, b"two");
+
+    let mut child = PtyChild::spawn(jar.command(&["mv", "a", "b"]));
+    child.read_until(b"overwrite b? [y/N] ");
+    child.write(b"y\n");
+    assert!(child.finish().status.success());
+    assert_eq!(jar.run(&["get", "b"]).stdout, b"one");
+    assert_eq!(code(&jar.run(&["get", "a"])), 1);
+}
+
+#[test]
+fn mv_to_the_same_name_is_an_error() {
+    let jar = Sandbox::new();
+    jar.set("a", b"one\n");
+    let out = jar.run(&["mv", "a", "a"]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("same"), "{}", stderr(&out));
+    assert_eq!(jar.run(&["get", "a"]).stdout, b"one");
+}
+
+#[test]
 fn env_emits_eval_safe_export_lines() {
     let jar = Sandbox::new();
     jar.set("work/aws-access-key", b"AKIA123\n");
@@ -565,6 +626,206 @@ fn a_store_rejects_a_different_identity() {
     assert_eq!(code(&out), 1);
     assert!(stderr(&out).contains("does not match"), "{}", stderr(&out));
     assert!(!jar.store_dir().join("second.age").exists());
+}
+
+fn identity_path(jar: &Sandbox) -> PathBuf {
+    jar.home.join("config/keyjar/identity")
+}
+
+fn public_key_of(identity_contents: &str) -> String {
+    identity_contents
+        .lines()
+        .find_map(|line| line.strip_prefix("# public key: "))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn rekey_round_trips_and_replaces_the_identity() {
+    let jar = Sandbox::new();
+    jar.set("openai", b"sk-1\n");
+    jar.set("work/aws", b"AKIA\n");
+    let identity = identity_path(&jar);
+    let before_identity = std::fs::read_to_string(&identity).unwrap();
+    let marker = jar.store_dir().join(".keyjar-recipient");
+    let entries = [
+        jar.store_dir().join("openai.age"),
+        jar.store_dir().join("work/aws.age"),
+    ];
+    let before_ciphertexts: Vec<_> = entries.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("rekeyed 2 entries"),
+        "{}",
+        stderr(&out)
+    );
+
+    // The whole key ring rotated: new key installed, old key kept, no .new.
+    let after_identity = std::fs::read_to_string(&identity).unwrap();
+    assert_ne!(after_identity, before_identity);
+    let old = jar.home.join("config/keyjar/identity.old");
+    assert_eq!(std::fs::read_to_string(&old).unwrap(), before_identity);
+    assert!(!jar.home.join("config/keyjar/identity.new").exists());
+
+    // The store followed: marker and every ciphertext rewritten.
+    let public = public_key_of(&after_identity);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        format!("{public}\n")
+    );
+    for (path, before) in entries.iter().zip(&before_ciphertexts) {
+        assert_ne!(&std::fs::read(path).unwrap(), before, "{}", path.display());
+    }
+    assert_eq!(jar.run(&["get", "openai"]).stdout, b"sk-1");
+    assert_eq!(jar.run(&["get", "work/aws"]).stdout, b"AKIA");
+
+    // The old key can no longer open the store.
+    let out = jar
+        .command(&["get", "openai"])
+        .env("KEYJAR_IDENTITY", &old)
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("does not match"), "{}", stderr(&out));
+}
+
+#[test]
+fn rekey_refuses_a_pipe_without_force() {
+    let jar = Sandbox::new();
+    jar.set("k", b"v\n");
+    let before = std::fs::read_to_string(identity_path(&jar)).unwrap();
+
+    let out = jar.run_with_stdin(&["rekey"], b"y\n");
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(identity_path(&jar)).unwrap(),
+        before
+    );
+    assert_eq!(jar.run(&["get", "k"]).stdout, b"v");
+}
+
+#[test]
+fn terminal_rekey_confirms() {
+    let jar = Sandbox::new();
+    jar.set("k", b"v\n");
+    let before = std::fs::read_to_string(identity_path(&jar)).unwrap();
+
+    let mut child = PtyChild::spawn(jar.command(&["rekey"]));
+    child.read_until(b"replace the identity? [y/N] ");
+    child.write(b"n\n");
+    assert!(child.finish().status.success());
+    assert_eq!(
+        std::fs::read_to_string(identity_path(&jar)).unwrap(),
+        before
+    );
+
+    let mut child = PtyChild::spawn(jar.command(&["rekey"]));
+    child.read_until(b"replace the identity? [y/N] ");
+    child.write(b"y\n");
+    assert!(child.finish().status.success());
+    assert_ne!(
+        std::fs::read_to_string(identity_path(&jar)).unwrap(),
+        before
+    );
+    assert_eq!(jar.run(&["get", "k"]).stdout, b"v");
+}
+
+#[test]
+fn rekey_with_no_store_is_an_error() {
+    let jar = Sandbox::new();
+    // Mint the identity through another store so the emptiness path is
+    // reached, not the missing-identity one.
+    let other = jar.home.join("other-store");
+    let out = jar.run_with_stdin(&["set", "k", "--store", other.to_str().unwrap()], b"v\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = std::fs::read_to_string(identity_path(&jar)).unwrap();
+
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("empty"), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(identity_path(&jar)).unwrap(),
+        before
+    );
+}
+
+// A store whose last entry was removed is still bound to its key; the marker
+// must follow the identity or the next set would bind to a dead key.
+#[test]
+fn rekey_after_removing_every_entry_still_rotates() {
+    let jar = Sandbox::new();
+    jar.set("k", b"v\n");
+    assert!(jar.run(&["rm", "-f", "k"]).status.success());
+    let before = std::fs::read_to_string(identity_path(&jar)).unwrap();
+
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("rekeyed 0 entries"),
+        "{}",
+        stderr(&out)
+    );
+    let after = std::fs::read_to_string(identity_path(&jar)).unwrap();
+    assert_ne!(after, before);
+    let marker = jar.store_dir().join(".keyjar-recipient");
+    let public = public_key_of(&after);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        format!("{public}\n")
+    );
+    jar.set("k2", b"v2\n");
+    assert_eq!(jar.run(&["get", "k2"]).stdout, b"v2");
+}
+
+#[test]
+fn a_leftover_new_identity_blocks_rekey() {
+    use age::secrecy::ExposeSecret;
+
+    let jar = Sandbox::new();
+    jar.set("k", b"v\n");
+    let identity = identity_path(&jar);
+    let before = std::fs::read_to_string(&identity).unwrap();
+    let new_path = jar.home.join("config/keyjar/identity.new");
+
+    // An unreadable .new means entries may be split between the keys.
+    std::fs::write(&new_path, "garbage").unwrap();
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("identity.new"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("split"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&identity).unwrap(), before);
+    assert_eq!(jar.run(&["get", "k"]).stdout, b"v");
+
+    // A .new matching the marker means the rotation finished and only the
+    // file swap remains; the advice must say exactly that.
+    let done = age::x25519::Identity::generate();
+    std::fs::write(&new_path, format!("{}\n", done.to_string().expose_secret())).unwrap();
+    std::fs::write(
+        jar.store_dir().join(".keyjar-recipient"),
+        format!("{}\n", done.to_public()),
+    )
+    .unwrap();
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("finish it"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_leftover_old_identity_blocks_rekey() {
+    let jar = Sandbox::new();
+    jar.set("k", b"v\n");
+    let identity = identity_path(&jar);
+    let before = std::fs::read_to_string(&identity).unwrap();
+    std::fs::write(jar.home.join("config/keyjar/identity.old"), "x").unwrap();
+
+    let out = jar.run(&["rekey", "-f"]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("identity.old"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&identity).unwrap(), before);
+    assert_eq!(jar.run(&["get", "k"]).stdout, b"v");
 }
 
 // Run as `sh SCRIPT` so exec never targets the freshly written file; a

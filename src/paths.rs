@@ -50,6 +50,14 @@ fn identity_path_from(
     Ok(xdg_join(xdg_config, home, ".config", "keyjar")?.join("identity"))
 }
 
+/// identity -> identity.new or identity.old. with_extension would eat an
+/// extension in a user-supplied KEYJAR_IDENTITY path.
+pub(crate) fn identity_sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// The XDG spec says a relative XDG_* value must be ignored.
 fn xdg_join(
     xdg: Option<OsString>,
@@ -117,6 +125,12 @@ mod tests {
     fn no_home_at_all_is_an_error() {
         assert!(store_dir_from(None, None, None, None).is_err());
         assert!(identity_path_from(None, None, None).is_err());
+    }
+
+    #[test]
+    fn identity_sibling_appends_to_a_dotted_name() {
+        let path = identity_sibling(Path::new("/keys/id.key"), ".new");
+        assert_eq!(path, PathBuf::from("/keys/id.key.new"));
     }
 
     #[test]

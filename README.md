@@ -37,6 +37,8 @@ keyjar ls work
 
 # Remove a value.
 keyjar rm openai
+# Rename a value.
+keyjar mv openai work/openai
 # Edit a value.
 keyjar edit personal/notes
 
@@ -44,6 +46,9 @@ keyjar edit personal/notes
 eval "$(keyjar env work)"       # exports AWS_ACCESS_KEY=...
 # Run a command with injected environment variables.
 keyjar run work -- terraform plan
+
+# Rotate to a fresh key, re-encrypting every entry.
+keyjar rekey
 ```
 
 | Exit code | Description                                                    |
@@ -70,6 +75,13 @@ generated on first use at `$XDG_CONFIG_HOME/keyjar/identity` (override with
 It is a standard age identity, so `age -d -i ~/.config/keyjar/identity FILE.age`
 also works. A store belongs to the identity that first wrote to it. Copy the
 directory whole to move or back it up.
+
+`rekey` keeps the previous key at `identity.old`; delete it once nothing needs
+it. The identity is shared across stores, so `rekey` rotates only the selected
+store and any other store keeps working through `identity.old`. An interrupted
+rekey leaves `identity.new` behind. keyjar refuses another rekey until it is
+resolved and says how, and `age -d -i identity -i identity.new FILE.age`
+decrypts any entry in the meantime.
 
 > [!WARNING]
 > Secret values are encrypted. Entry names, directory structure, file sizes, and

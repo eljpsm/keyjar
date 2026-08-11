@@ -43,10 +43,23 @@ pub(crate) fn load_identity(path: &Path) -> anyhow::Result<x25519::Identity> {
 
 fn generate_identity(path: &Path) -> anyhow::Result<(x25519::Identity, IdentitySource)> {
     let identity = x25519::Identity::generate();
-    let parent = path.parent().context("identity path has no parent")?;
+    match write_identity_file(path, &identity) {
+        Ok(()) => Ok((identity, IdentitySource::Created)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok((load_identity(path)?, IdentitySource::Existed))
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Write an identity file atomically, 0600 from the first byte: the key must
+/// never be readable by others, not even between write and chmod. Refuses an
+/// existing file; the caller decides what one means.
+pub(crate) fn write_identity_file(path: &Path, identity: &x25519::Identity) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::other("identity path has no parent"));
+    };
     create_private_dirs(parent)?;
-    // Atomic and 0600 from the first byte: the key must never be readable
-    // by others, not even between write and chmod.
     let mut file = tempfile::Builder::new()
         .prefix(".keyjar-")
         .permissions(std::fs::Permissions::from_mode(0o600))
@@ -55,13 +68,9 @@ fn generate_identity(path: &Path) -> anyhow::Result<(x25519::Identity, IdentityS
     writeln!(file, "# public key: {}", identity.to_public())?;
     writeln!(file, "{}", identity.to_string().expose_secret())?;
     file.flush()?;
-    match file.persist_noclobber(path) {
-        Ok(_) => Ok((identity, IdentitySource::Created)),
-        Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok((load_identity(path)?, IdentitySource::Existed))
-        }
-        Err(err) => Err(err.error.into()),
-    }
+    file.persist_noclobber(path)
+        .map(|_| ())
+        .map_err(|err| err.error)
 }
 
 /// Directories that hold key material are 0700. create_dir_all applies the

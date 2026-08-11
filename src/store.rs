@@ -71,6 +71,10 @@ impl Store {
             .with_context(|| format!("creating {}", self.dir.display()))?;
         let _lock = self.lock(LockMode::Exclusive)?;
         self.bind_recipient(recipient)?;
+        self.write_entry_unlocked(name, ciphertext)
+    }
+
+    fn write_entry_unlocked(&self, name: &Name, ciphertext: &[u8]) -> anyhow::Result<()> {
         let path = self.entry_path(name);
         let parent = path.parent().expect("entry paths always have a parent");
         create_private_dirs(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -104,6 +108,13 @@ impl Store {
                 return Err(err).with_context(|| format!("removing {}", path.display()));
             }
         }
+        self.prune_empty_parents(&path);
+        Ok(true)
+    }
+
+    /// remove_dir fails on a non-empty directory, so the walk stops at the
+    /// first parent that still holds something.
+    fn prune_empty_parents(&self, path: &Path) {
         let mut parent = path.parent();
         while let Some(dir) = parent {
             if dir == self.dir || std::fs::remove_dir(dir).is_err() {
@@ -111,7 +122,76 @@ impl Store {
             }
             parent = dir.parent();
         }
+    }
+
+    /// Move an entry's ciphertext unchanged; the whole store shares one
+    /// recipient, so no identity is needed. False means the source did not
+    /// exist. Refuses an existing destination unless `overwrite`.
+    pub(crate) fn rename(&self, old: &Name, new: &Name, overwrite: bool) -> anyhow::Result<bool> {
+        if !self.dir.exists() {
+            return Ok(false);
+        }
+        let _lock = self.lock(LockMode::Exclusive)?;
+        self.check_marker_exists(&self.list_unlocked()?)?;
+        let old_path = self.entry_path(old);
+        if !old_path.exists() {
+            return Ok(false);
+        }
+        let new_path = self.entry_path(new);
+        // The recheck under the lock backs the caller's prompt: a destination
+        // that appeared since was never confirmed for overwrite.
+        if !overwrite && new_path.exists() {
+            bail!("an entry named {new} already exists");
+        }
+        let parent = new_path.parent().expect("entry paths always have a parent");
+        create_private_dirs(parent).with_context(|| format!("creating {}", parent.display()))?;
+        std::fs::rename(&old_path, &new_path)
+            .with_context(|| format!("renaming {}", old_path.display()))?;
+        self.prune_empty_parents(&old_path);
         Ok(true)
+    }
+
+    /// Rotate every entry to a new recipient under one exclusive lock.
+    /// `transform` maps each entry's ciphertext under `old` to ciphertext
+    /// under `new`; every transform runs before anything is written, so a bad
+    /// entry aborts with the store untouched. `checkpoint` runs between the
+    /// last transform and the first rewrite; the caller persists the new key
+    /// there, so at every crash point a key for every entry is on disk. The
+    /// marker is written last, which makes a finished-but-not-installed rekey
+    /// detectable from the outside.
+    pub(crate) fn rekey(
+        &self,
+        old: &x25519::Recipient,
+        new: &x25519::Recipient,
+        transform: impl Fn(&Name, &[u8]) -> anyhow::Result<Vec<u8>>,
+        checkpoint: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<usize> {
+        if !self.dir.exists() {
+            bail!("store is empty; nothing to rekey");
+        }
+        let _lock = self.lock(LockMode::Exclusive)?;
+        self.check_recipient(old)?;
+        let names = self.list_unlocked()?;
+        // A marker with zero entries still rekeys: the marker binds the store
+        // and must follow the identity.
+        if names.is_empty() && !self.dir.join(RECIPIENT_FILE).exists() {
+            bail!("store is empty; nothing to rekey");
+        }
+        let mut rewritten = Vec::with_capacity(names.len());
+        for name in names {
+            let ciphertext = self
+                .read_unlocked(&name)?
+                .context("entry vanished while the store was locked")?;
+            let ciphertext =
+                transform(&name, &ciphertext).with_context(|| format!("entry {name}"))?;
+            rewritten.push((name, ciphertext));
+        }
+        checkpoint()?;
+        for (name, ciphertext) in &rewritten {
+            self.write_entry_unlocked(name, ciphertext)?;
+        }
+        self.write_marker_unlocked(new)?;
+        Ok(rewritten.len())
     }
 
     /// Sorted names. A missing store directory lists as empty: on a fresh
@@ -253,23 +333,20 @@ impl Store {
         }
     }
 
-    /// Reject an identity that does not own this store. Without the check a
-    /// second identity would write entries nothing can decrypt as a set, and
-    /// reads would fail one entry at a time instead of saying why.
-    ///
-    /// A missing marker over an empty store is the fresh case, and callers
-    /// that go on to write bind it. A missing marker over entries means the
-    /// store was tampered with or half copied, so refuse.
-    fn check_recipient(&self, recipient: &x25519::Recipient) -> anyhow::Result<()> {
+    /// The recipient this store is bound to, if a marker exists.
+    pub(crate) fn bound_recipient(&self) -> anyhow::Result<Option<x25519::Recipient>> {
+        if !self.dir.exists() {
+            return Ok(None);
+        }
+        let _lock = self.lock(LockMode::Shared)?;
+        self.read_marker()
+    }
+
+    fn read_marker(&self) -> anyhow::Result<Option<x25519::Recipient>> {
         let path = self.dir.join(RECIPIENT_FILE);
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if self.list_unlocked()?.is_empty() {
-                    return Ok(());
-                }
-                bail!("store has entries but no recipient marker");
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
                 return Err(err).with_context(|| format!("reading {}", path.display()));
             }
@@ -281,10 +358,27 @@ impl Store {
         let stored = x25519::Recipient::from_str(line)
             .map_err(|e| anyhow::anyhow!(e))
             .context("malformed store recipient marker")?;
-        if &stored != recipient {
-            bail!("selected identity does not match the store recipient");
+        Ok(Some(stored))
+    }
+
+    /// Reject an identity that does not own this store. Without the check a
+    /// second identity would write entries nothing can decrypt as a set, and
+    /// reads would fail one entry at a time instead of saying why.
+    ///
+    /// A missing marker over an empty store is the fresh case, and callers
+    /// that go on to write bind it. A missing marker over entries means the
+    /// store was tampered with or half copied, so refuse.
+    fn check_recipient(&self, recipient: &x25519::Recipient) -> anyhow::Result<()> {
+        match self.read_marker()? {
+            Some(stored) if &stored == recipient => Ok(()),
+            Some(_) => bail!("selected identity does not match the store recipient"),
+            None => {
+                if self.list_unlocked()?.is_empty() {
+                    return Ok(());
+                }
+                bail!("store has entries but no recipient marker");
+            }
         }
-        Ok(())
     }
 
     /// The same invariant for operations that never see an identity (`ls`,
@@ -294,6 +388,22 @@ impl Store {
         if !names.is_empty() && !self.dir.join(RECIPIENT_FILE).exists() {
             bail!("store has entries but no recipient marker");
         }
+        Ok(())
+    }
+
+    /// Overwrite the marker. Only rekey may do this, under the exclusive
+    /// lock; every other writer goes through bind_recipient's noclobber.
+    fn write_marker_unlocked(&self, recipient: &x25519::Recipient) -> anyhow::Result<()> {
+        let path = self.dir.join(RECIPIENT_FILE);
+        let mut file = tempfile::Builder::new()
+            .prefix(".keyjar-")
+            .permissions(std::fs::Permissions::from_mode(0o600))
+            .tempfile_in(&self.dir)
+            .with_context(|| format!("creating temp file in {}", self.dir.display()))?;
+        writeln!(file, "{recipient}")?;
+        file.flush()?;
+        file.persist(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
@@ -493,6 +603,241 @@ mod tests {
     }
 
     #[test]
+    fn rename_moves_ciphertext_and_prunes_empty_parents() {
+        let (_dir, store) = temp_store();
+        let recipient = recipient();
+        store
+            .write(&name("work/deep/key"), &recipient, b"cipher")
+            .unwrap();
+        assert!(
+            store
+                .rename(&name("work/deep/key"), &name("personal/key"), false)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .read(&name("personal/key"), &recipient)
+                .unwrap()
+                .unwrap(),
+            b"cipher"
+        );
+        assert!(!store.dir.join("work").exists());
+        assert!(store.dir.join(RECIPIENT_FILE).exists());
+    }
+
+    #[test]
+    fn rename_of_a_missing_source_returns_false() {
+        let (_dir, store) = temp_store();
+        assert!(!store.rename(&name("a"), &name("b"), false).unwrap());
+        store.write(&name("x"), &recipient(), b"c").unwrap();
+        assert!(!store.rename(&name("a"), &name("b"), false).unwrap());
+    }
+
+    #[test]
+    fn rename_refuses_an_existing_destination_without_overwrite() {
+        let (_dir, store) = temp_store();
+        let recipient = recipient();
+        store.write(&name("a"), &recipient, b"one").unwrap();
+        store.write(&name("b"), &recipient, b"two").unwrap();
+        assert!(store.rename(&name("a"), &name("b"), false).is_err());
+        assert_eq!(store.read(&name("a"), &recipient).unwrap().unwrap(), b"one");
+        assert_eq!(store.read(&name("b"), &recipient).unwrap().unwrap(), b"two");
+    }
+
+    #[test]
+    fn rename_overwrites_when_asked() {
+        let (_dir, store) = temp_store();
+        let recipient = recipient();
+        store.write(&name("a"), &recipient, b"one").unwrap();
+        store.write(&name("b"), &recipient, b"two").unwrap();
+        assert!(store.rename(&name("a"), &name("b"), true).unwrap());
+        assert_eq!(store.read(&name("a"), &recipient).unwrap(), None);
+        assert_eq!(store.read(&name("b"), &recipient).unwrap().unwrap(), b"one");
+    }
+
+    #[test]
+    fn rekey_rewrites_every_entry_and_the_marker() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        let new = recipient();
+        store.write(&name("a"), &old, b"a-old").unwrap();
+        store.write(&name("w/b"), &old, b"b-old").unwrap();
+        let count = store
+            .rekey(
+                &old,
+                &new,
+                |_, ciphertext| Ok([b"new-", ciphertext].concat()),
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(store.read(&name("a"), &new).unwrap().unwrap(), b"new-a-old");
+        assert_eq!(
+            store.read(&name("w/b"), &new).unwrap().unwrap(),
+            b"new-b-old"
+        );
+        assert!(store.read(&name("a"), &old).is_err());
+        assert_eq!(store.bound_recipient().unwrap(), Some(new));
+    }
+
+    #[test]
+    fn rekey_runs_the_checkpoint_after_transforms_and_before_writes() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        let path = store.dir.join("a.age");
+        store.write(&name("a"), &old, b"old-bytes").unwrap();
+        let transformed = std::cell::Cell::new(false);
+        store
+            .rekey(
+                &old,
+                &recipient(),
+                |_, _| {
+                    transformed.set(true);
+                    Ok(b"new-bytes".to_vec())
+                },
+                || {
+                    assert!(transformed.get());
+                    assert_eq!(std::fs::read(&path).unwrap(), b"old-bytes");
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-bytes");
+    }
+
+    #[test]
+    fn a_failing_transform_leaves_the_store_untouched_and_skips_the_checkpoint() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        store.write(&name("a"), &old, b"one").unwrap();
+        store.write(&name("b"), &old, b"two").unwrap();
+        let checkpointed = std::cell::Cell::new(false);
+        let err = store
+            .rekey(
+                &old,
+                &recipient(),
+                |name, _| anyhow::bail!("cannot read {name}"),
+                || {
+                    checkpointed.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("entry a"), "{err:#}");
+        assert!(!checkpointed.get());
+        assert_eq!(store.read(&name("a"), &old).unwrap().unwrap(), b"one");
+        assert_eq!(store.read(&name("b"), &old).unwrap().unwrap(), b"two");
+    }
+
+    #[test]
+    fn a_failing_checkpoint_leaves_the_store_untouched() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        store.write(&name("a"), &old, b"one").unwrap();
+        let result = store.rekey(
+            &old,
+            &recipient(),
+            |_, _| Ok(b"new".to_vec()),
+            || anyhow::bail!("no key written"),
+        );
+        assert!(result.is_err());
+        assert_eq!(store.read(&name("a"), &old).unwrap().unwrap(), b"one");
+    }
+
+    #[test]
+    fn rekey_rejects_the_wrong_old_recipient() {
+        let (_dir, store) = temp_store();
+        store.write(&name("a"), &recipient(), b"c").unwrap();
+        let transformed = std::cell::Cell::new(false);
+        let result = store.rekey(
+            &recipient(),
+            &recipient(),
+            |_, ciphertext| {
+                transformed.set(true);
+                Ok(ciphertext.to_vec())
+            },
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!transformed.get());
+    }
+
+    #[test]
+    fn rekey_with_a_marker_but_no_entries_still_updates_the_marker() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        let new = recipient();
+        store.write(&name("a"), &old, b"c").unwrap();
+        assert!(store.remove(&name("a")).unwrap());
+        let count = store
+            .rekey(&old, &new, |_, c| Ok(c.to_vec()), || Ok(()))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(store.bound_recipient().unwrap(), Some(new.clone()));
+        assert!(store.write(&name("b"), &old, b"c").is_err());
+        store.write(&name("b"), &new, b"c").unwrap();
+    }
+
+    #[test]
+    fn rekey_of_an_empty_store_is_an_error() {
+        let (_dir, store) = temp_store();
+        let err = store
+            .rekey(&recipient(), &recipient(), |_, c| Ok(c.to_vec()), || Ok(()))
+            .unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err:#}");
+        create_private_dirs(&store.dir).unwrap();
+        assert!(
+            store
+                .rekey(&recipient(), &recipient(), |_, c| Ok(c.to_vec()), || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rekey_blocks_concurrent_readers_until_it_finishes() {
+        let (_dir, store) = temp_store();
+        let old = recipient();
+        let new = recipient();
+        store.write(&name("a"), &old, b"old").unwrap();
+
+        let (entered_sender, entered) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let rekey_store = Store::open(store.dir.clone());
+        let rekey_new = new.clone();
+        let rekeyer = std::thread::spawn(move || {
+            rekey_store
+                .rekey(
+                    &old,
+                    &rekey_new,
+                    move |_, _| {
+                        entered_sender.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(b"rotated".to_vec())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let reader_store = Store::open(store.dir.clone());
+        let reader_new = new.clone();
+        let (sent, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let snapshot = reader_store.snapshot(None, &reader_new).unwrap();
+            sent.send(snapshot).unwrap();
+        });
+
+        // The reader must be stuck behind rekey's exclusive lock.
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        release.send(()).unwrap();
+        let snapshot = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(snapshot, [(name("a"), b"rotated".to_vec())]);
+        rekeyer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn a_store_rejects_a_different_recipient() {
         let (_dir, store) = temp_store();
         let first = recipient();
@@ -603,6 +948,12 @@ mod tests {
         assert!(store.write(&name("new"), &recipient, b"c").is_err());
         assert!(store.list(None).is_err());
         assert!(store.remove(&name("old")).is_err());
+        assert!(store.rename(&name("old"), &name("new"), false).is_err());
+        assert!(
+            store
+                .rekey(&recipient, &recipient, |_, c| Ok(c.to_vec()), || Ok(()))
+                .is_err()
+        );
         assert!(!store.dir.join(RECIPIENT_FILE).exists());
     }
 
