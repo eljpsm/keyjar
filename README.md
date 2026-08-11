@@ -40,7 +40,6 @@ keyjar rm openai
 # Edit a value.
 keyjar edit personal/notes
 
-
 # Inject environment variables.
 eval "$(keyjar env work)"       # exports AWS_ACCESS_KEY=...
 # Run a command with injected environment variables.
