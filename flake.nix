@@ -30,6 +30,7 @@
             pkgs.rust-analyzer
             pkgs.gnumake
             pkgs.cargo-llvm-cov
+            pkgs.prek
           ];
           # rust-analyzer needs the std sources for completion in the deps.
           env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";

@@ -1,0 +1,44 @@
+#:schema https://www.schemastore.org/prek.json
+
+default_install_hook_types = ["pre-commit", "pre-push"]
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-toml" },
+  { id = "check-yaml" },
+  { id = "check-merge-conflict" },
+  { id = "detect-private-key" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "fmt"
+name = "cargo fmt"
+language = "system"
+entry = "cargo fmt --check"
+types = ["rust"]
+pass_filenames = false
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "lint"
+name = "make lint"
+language = "system"
+entry = "make lint"
+pass_filenames = false
+always_run = true
+stages = ["pre-push"]
+
+[[repos.hooks]]
+id = "test"
+name = "cargo test"
+language = "system"
+entry = "cargo test"
+pass_filenames = false
+always_run = true
+stages = ["pre-push"]

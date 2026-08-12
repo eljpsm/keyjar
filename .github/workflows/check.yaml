@@ -27,8 +27,5 @@ jobs:
 
       - uses: ./.github/actions/setup
 
-      - name: fmt
-        run: nix develop --command cargo fmt --check
-
-      - name: lint
-        run: nix develop --command make lint
+      - name: hooks
+        run: nix develop --command prek run --all-files --stage pre-push --skip test
