@@ -3,7 +3,7 @@
 //! KEYJAR_* variables. PTY tests cover terminal-only safety checks.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
@@ -59,7 +59,13 @@ impl Sandbox {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(input).unwrap();
+        // A child that rejects its arguments exits without reading stdin, so
+        // the pipe may already be closed by the time this write lands.
+        match child.stdin.take().unwrap().write_all(input) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => {}
+            Err(e) => panic!("write stdin: {e}"),
+        }
         child.wait_with_output().unwrap()
     }
 
