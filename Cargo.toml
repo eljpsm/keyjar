@@ -18,7 +18,7 @@ libc = "0.2"
 tempfile = "3"
 
 [dev-dependencies]
-nix = { version = "0.31", features = ["term"] }
+nix = { version = "=0.31.3", features = ["term"] }
 
 [profile.release]
 strip = true
